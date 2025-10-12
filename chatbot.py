@@ -248,6 +248,22 @@ class CustomerSupportChatbot:
             return f"According to Amazon's policy: {result['answer']}"
         return None
 
+    def validate_response_uses_context(self, response, context_docs):
+        """Check if response contains keywords from context"""
+        if not re.search(r"\[\d+\]", response):
+            return False
+        
+        context_keywords = set()
+        for doc in context_docs[:2]:
+            # Extract key terms (simple version)
+            words = re.findall(r'\b[a-z]{4,}\b', doc.lower())
+            context_keywords.update(words[:20])  # Top 20 words per doc
+        
+        response_words = set(re.findall(r'\b[a-z]{4,}\b', response.lower()))
+        overlap = len(context_keywords & response_words)
+        
+        return overlap >= 3  # Require at least 3 matching keywords
+
     def generate_response(self, customer_message, max_length=250, temperature=0.8, max_retries=2):
         """Generate a response, with a retry mechanism to avoid canned DM requests."""
         # Append the latest customer message to history
@@ -262,46 +278,43 @@ class CustomerSupportChatbot:
         context_docs = self.knowledge_base.search_documents(customer_message, k=k_context)
         context_section = "No relevant context found."
         if context_docs:
-            # Frame the context clearly for the model
-            context_section = "\n\n---\n\n".join(context_docs)
+            context_section = "\n\n".join(
+                f"[{idx + 1}] {doc}" for idx, doc in enumerate(context_docs)
+            )
         
         # Debugging: Print the retrieved context
         print("Retrieved context for debugging:\n", context_section)
         
-        # Create a more explicit and structured input prompt
-        instruction = (
-            "You are a helpful Amazon customer support assistant. "
-            "You MUST answer using ONLY the policy information provided below. "
-            "Start your answer by referencing the specific policy (e.g., 'According to Amazon's return policy...'). "
-            "If the policy information doesn't contain the answer, say 'I don't have that information in our current policies.' "
-            "Never make up information or suggest contacting support via DM."
-        )
-        
+        # **IMPROVED: More explicit instruction-following prompt**
         input_text = (
-            f"{instruction}\n\n"
-            f"Recent conversation:\n{history_prompt}\n\n"
-            f"Customer question: {customer_message}\n\n"
-            f"Relevant Amazon policy information:\n{context_section}\n\n"
-            f"Based on the policy information above, provide a helpful answer:\n"
-            f"Support:"
+            "You are an Amazon customer support agent. Follow these rules strictly:\n"
+            "1. Answer ONLY using information from the Context below\n"
+            "2. Copy relevant phrases directly from the Context\n"
+            "3. After each fact, add [X] where X is the context number\n"
+            "4. If the Context doesn't contain the answer, say: 'I don't have that specific information in our records.'\n"
+            "5. Do NOT use external knowledge or training data\n\n"
+            f"Context:\n{context_section}\n\n"
+            f"Customer: {customer_message}\n"
+            "Support (remember to cite [X] after each fact):"
         )
         
-        # Try extractive QA first
-        extracted_answer = self.extract_answer_from_context(customer_message, context_docs)
-        if extracted_answer:
-            self.history.append(f"Support: {extracted_answer}")
-            return extracted_answer
+        # **REMOVED: extractive QA - causes issues with TinyLlama**
+        # Try template-based response first for common queries
+        template_response = self.get_template_response(customer_message, context_docs)
+        if template_response:
+            self.history.append(f"Support: {template_response}")
+            return template_response
         
         response = "" # Initialize response to handle cases where all retries fail
         for attempt in range(max_retries + 1):
-            # On retries, use a higher temperature to encourage diversity
-            current_temp = temperature + (attempt * 0.15)
+            # **ADJUSTED: Lower temperature for more faithful copying**
+            current_temp = max(0.3, temperature - (attempt * 0.1))
 
-            encoded_input = self.tokenizer(input_text, return_tensors='pt')
+            encoded_input = self.tokenizer(input_text, return_tensors='pt', truncation=True, max_length=1024)
             input_ids = encoded_input['input_ids'].to(self.device)
             attention_mask = encoded_input['attention_mask'].to(self.device)
             
-            print("Generating response from model...") # Added for feedback
+            print(f"Generating response from model (attempt {attempt+1}, temp={current_temp:.2f})...")
             with torch.no_grad():
                 output = self.model.generate(
                     input_ids,
@@ -309,80 +322,124 @@ class CustomerSupportChatbot:
                     max_length=input_ids.shape[1] + max_length,
                     temperature=current_temp,
                     do_sample=True,
-                    top_p=0.95,
-                    top_k=50,
-                    repetition_penalty=1.5, # Increased penalty
-                    no_repeat_ngram_size=3,
+                    top_p=0.9,  # Lower for more focused sampling
+                    top_k=40,
+                    repetition_penalty=1.8,  # Higher penalty
+                    no_repeat_ngram_size=4,  # Prevent 4-word repetitions
                     pad_token_id=self.tokenizer.eos_token_id,
                     eos_token_id=self.tokenizer.eos_token_id
                 )
                 
             generated_text = self.tokenizer.decode(output[0], skip_special_tokens=True)
             
-            # Isolate the newly generated text more reliably
-            response_start_tag = "Answer:"
-            response_start_index = generated_text.rfind(response_start_tag)
-            if response_start_index != -1:
-                response = generated_text[response_start_index + len(response_start_tag):].strip()
+            # **IMPROVED: Better extraction**
+            if "Support (remember to cite" in generated_text:
+                response = generated_text.split("Support (remember to cite")[-1].split(":")[-1].strip()
+            elif "Support:" in generated_text:
+                response = generated_text.split("Support:")[-1].strip()
             else:
-                # Fallback if the 'Answer:' tag is not in the output
-                response_start = generated_text.find(history_prompt) + len(history_prompt)
-                response = generated_text[response_start:].replace("Support:", "").strip()
-
-            # If the response does not contain a DM request, clean and return it
-            if not self.dm_pattern.search(response):
-                # After generating response, add it to history
+                response = generated_text[len(input_text):].strip()
+        
+            # Stop at first newline or when context is repeated
+            response = response.split('\n')[0].strip()
+            
+            # **RELAXED: Check for ANY citation marker**
+            has_citation = bool(re.search(r'\[\d+\]', response))
+            uses_context_words = self.validate_response_uses_context(response, context_docs)
+            
+            if has_citation or uses_context_words:
+                print(f"✓ Valid response generated (citations={has_citation}, context_match={uses_context_words})")
                 self.history.append(f"Support: {response}")
                 response = self.clean_response(response)
-                response = self.correct_grammar(response)  # Correct grammar
                 return response
-
-        # If all retries fail, return the last generated response after cleaning
-        response = self.clean_response(response)
-        response = self.correct_grammar(response)  # Correct grammar
-        return response
+            else:
+                print(f"✗ Attempt {attempt + 1}: No citations or context match, retrying...")
     
+        # **FALLBACK: If model fails, construct response manually**
+        print("⚠ Model failed all attempts. Using template fallback.")
+        fallback = self.construct_fallback_response(customer_message, context_docs)
+        self.history.append(f"Support: {fallback}")
+        return fallback
+
+    def get_template_response(self, question, context_docs):
+        """Generate template-based responses for common queries"""
+        question_lower = question.lower()
+        
+        # Shipping time query
+        if any(word in question_lower for word in ["shipping time", "delivery time", "how long"]):
+            # Extract shipping times from context
+            times = []
+            for doc in context_docs:
+                matches = re.findall(r'(Standard|Express|Priority|Two-Day|One-Day) Shipping[\s\n]+(\d+[–-]\d+ business days)', doc)
+                times.extend(matches)
+            
+            if times:
+                response = "Our shipping times are: "
+                for method, duration in times[:3]:  # Top 3 methods
+                    response += f"{method} Shipping takes {duration} [1]. "
+                return response.strip()
+        
+        return None
+
+    def construct_fallback_response(self, question, context_docs):
+        """Construct a response by extracting key facts from context"""
+        if not context_docs:
+            return "I apologize, but I don't have specific information about that in our current database."
+        
+        # Extract first 2 sentences from top context
+        top_context = context_docs[0]
+        sentences = re.split(r'[.!?]\s+', top_context)
+        relevant_text = '. '.join(sentences[:2]).strip()
+        
+        if len(relevant_text) > 20:
+            return f"Based on our records: {relevant_text} [1]"
+        else:
+            return "I don't have detailed information about that at the moment. Could you please rephrase your question?"
+
     def clean_response(self, text):
-        """More aggressive post-processing to remove artifacts."""
-        # 1. Remove the [USER] token (case-insensitive)
+        """More targeted post-processing to remove artifacts."""
+        # Remove [USER] token
         text = re.sub(r'\[USER\]', '', text, flags=re.IGNORECASE).strip()
         
-        # 2. Remove signature-like gibberish and random character strings
-        # This regex is more aggressive and targets strings of capital letters/spaces
-        text = re.sub(r'\b([A-Z]{2,}\s+){3,}[A-Z]{2,}\b', '', text) # e.g., JEZ HM KI MH...
-        text = re.sub(r'\b[a-zA-Z0-9]{8,}\b', '', text)
-        text = re.sub(r'\b[a-zA-Z]*[0-9]+[a-zA-Z0-9]*\b', '', text)
-        text = re.sub(r'\s-\w+\b', '', text) # Removes agent tags like " -EmmaW"
-        text = re.sub(r'-[A-Z]{2,}\b', '', text) # Removes tags like "-LHJBY"
-
-        # 3. Remove duplicate sentences
-        sentences = re.split(r'([.!?])\s*', text)
-        if len(sentences) > 1:
-            grouped_sentences = ["".join(s).strip() for s in zip(sentences[0::2], sentences[1::2])]
-            # Remove sentences that are too short or look incomplete
-            grouped_sentences = [s for s in grouped_sentences if len(s.split()) > 3 and not re.search(r"\bwe'd your and\b", s)]
-            unique_sentences = list(dict.fromkeys(s for s in grouped_sentences if s))
-            text = ' '.join(unique_sentences)
+        # Remove agent signatures (e.g., "-EmmaW", "-LHJBY") 
+        text = re.sub(r'\s*-[A-Z]{2,}\w*\b', '', text)
         
-        # 4. Final cleanup for extra whitespace and dangling punctuation
+        # Remove obvious gibberish (3+ consecutive capital letters)
+        text = re.sub(r'\b([A-Z]{3,}\s+)+[A-Z]{3,}\b', '', text)
+        
+        # Remove incomplete sentences at the end
+        sentences = re.split(r'([.!?])', text)
+        if len(sentences) > 2:
+            # Reconstruct sentences
+            clean_sentences = []
+            for i in range(0, len(sentences)-1, 2):
+                sentence = (sentences[i] + (sentences[i+1] if i+1 < len(sentences) else '')).strip()
+                if len(sentence.split()) > 3:  # Keep sentences with 4+ words
+                    clean_sentences.append(sentence)
+            text = ' '.join(clean_sentences)
+        
+        # Final whitespace cleanup
         text = ' '.join(text.split()).strip()
-        text = re.sub(r'\s+([.!?])', r'\1', text) # remove space before punctuation
-
+        
         return text if text else "I'm sorry, I'm having trouble with that request. Could you please rephrase?"
 
     def correct_grammar(self, text):
-        """Use LanguageTool API to correct grammar and sentence fragments."""
+        """Use LanguageTool API to correct grammar - only on final short response."""
+        # Skip grammar check if text is too long
+        if len(text) > 1000:
+            print("Skipping grammar correction - text too long")
+            return text
+        
         url = "https://api.languagetoolplus.com/v2/check"
         data = {
             "text": text,
             "language": "en-US"
         }
         try:
-            # Added a timeout to prevent indefinite hanging
             response = requests.post(url, data=data, timeout=5)
-            response.raise_for_status() # Raise an exception for bad status codes
+            response.raise_for_status()
             matches = response.json().get("matches", [])
-            for match in reversed(matches):  # Reverse to not mess up offsets
+            for match in reversed(matches):
                 replacement = match.get("replacements", [])
                 if replacement:
                     start = match["offset"]
@@ -390,7 +447,7 @@ class CustomerSupportChatbot:
                     text = text[:start] + replacement[0]["value"] + text[end:]
             return text
         except requests.exceptions.RequestException as e:
-            print(f"Grammar correction failed due to network error: {e}")
+            print(f"Grammar correction skipped: {e}")
             return text
         except Exception as e:
             print(f"Grammar correction failed: {e}")

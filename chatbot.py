@@ -28,57 +28,68 @@ class KnowledgeBase:
         if os.path.exists(os.path.join(index_path, "index.faiss")):
             self.load_knowledge_base()
         
-    def crawl_website(self, urls, max_depth=1, max_pages=100):
-        """Crawl websites from the provided URLs"""
-        urls_to_visit = [(url, 0) for url in urls]  # (url, depth)
-        visited = set()
+    # def crawl_website(self, urls, max_depth=1, max_pages=100):
+    #     """Crawl websites from the provided URLs"""
+    #     urls_to_visit = [(url, 0) for url in urls]  # (url, depth)
+    #     visited = set()
         
-        all_docs = []
-        page_count = 0
+    #     all_docs = []
+    #     page_count = 0
         
-        while urls_to_visit and page_count < max_pages:
-            url, depth = urls_to_visit.pop(0)
+    #     while urls_to_visit and page_count < max_pages:
+    #         url, depth = urls_to_visit.pop(0)
             
-            if url in visited or depth > max_depth:
-                continue
+    #         if url in visited or depth > max_depth:
+    #             continue
                 
-            visited.add(url)
-            print(f"Crawling {url} (depth {depth})")
+    #         visited.add(url)
+    #         print(f"Crawling {url} (depth {depth})")
             
-            try:
-                loader = WebBaseLoader(url)
-                url_docs = loader.load()
-                all_docs.extend(url_docs)
-                self.urls_crawled.add(url)
-                page_count += 1
+    #         try:
+    #             loader = WebBaseLoader(url)
+    #             url_docs = loader.load()
+    #             all_docs.extend(url_docs)
+    #             self.urls_crawled.add(url)
+    #             page_count += 1
                 
-                # Rate limiting to be respectful
-                time.sleep(1)
+    #             # Rate limiting to be respectful
+    #             time.sleep(1)
                 
-                if depth < max_depth:
-                    # Find links to follow
-                    response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
-                    soup = BeautifulSoup(response.text, "html.parser")
-                    links = soup.find_all("a", href=True)
+    #             if depth < max_depth:
+    #                 # Find links to follow
+    #                 response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
+    #                 soup = BeautifulSoup(response.text, "html.parser")
+    #                 links = soup.find_all("a", href=True)
                     
-                    base_url = "/".join(url.split("/")[:3])  # e.g., https://www.amazon.com
+    #                 base_url = "/".join(url.split("/")[:3])  # e.g., https://www.amazon.com
                     
-                    for link in links:
-                        href = link["href"]
+    #                 for link in links:
+    #                     href = link["href"]
                         
-                        # Convert relative URLs to absolute
-                        if href.startswith("/"):
-                            href = base_url + href
+    #                     # Convert relative URLs to absolute
+    #                     if href.startswith("/"):
+    #                         href = base_url + href
                         
-                        # Only follow links from the same domain
-                        if href.startswith(base_url) and href not in visited:
-                            urls_to_visit.append((href, depth + 1))
+    #                     # Only follow links from the same domain
+    #                     if href.startswith(base_url) and href not in visited:
+    #                         urls_to_visit.append((href, depth + 1))
                 
-            except Exception as e:
-                print(f"Error crawling {url}: {e}")
+    #         except Exception as e:
+    #             print(f"Error crawling {url}: {e}")
         
-        return all_docs
+    #     return all_docs
     
+    def ingest_manual_file(self, manual_path):
+        """Ingest the manual RAG file as a single document"""
+        print(f"Ingesting manual knowledge base from {manual_path}...")
+        with open(manual_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        # Wrap as a LangChain Document
+        from langchain.docstore.document import Document
+        doc = Document(page_content=content, metadata={"source": manual_path})
+        return [doc]
+
+
     def process_documents(self, documents):
         """Process and split documents into chunks"""
         text_splitter = RecursiveCharacterTextSplitter(
@@ -94,8 +105,9 @@ class KnowledgeBase:
         """Build the knowledge base from the provided URLs"""
         print("Starting to build knowledge base...")
         # Crawl websites
-        documents = self.crawl_website(urls)
-        
+        #documents = self.crawl_website(urls)
+        documents = self.ingest_manual_file("c:/Users/chaid/Jin/CSC525/knowledge_base_manual.txt")
+
         # Process documents
         print(f"Processing {len(documents)} documents...")
         chunks = self.process_documents(documents)
@@ -103,6 +115,27 @@ class KnowledgeBase:
         # Build vector store
         if not chunks:
             print("No documents were retrieved. Check the URLs and try again.")
+            return False
+        
+        print(f"Creating vector store with {len(chunks)} chunks...")
+        self.db = FAISS.from_documents(chunks, self.embedding_model)
+        
+        # Save the knowledge base
+        self.save_knowledge_base()
+        return True
+    
+    def build_knowledge_base_from_manual(self, manual_path):
+        """Build the knowledge base from the manual file"""
+        print("Starting to build knowledge base from manual file...")
+        documents = self.ingest_manual_file(manual_path)
+        
+        # Process documents
+        print(f"Processing {len(documents)} documents...")
+        chunks = self.process_documents(documents)
+        
+        # Build vector store
+        if not chunks:
+            print("No chunks were created from the manual file.")
             return False
         
         print(f"Creating vector store with {len(chunks)} chunks...")
@@ -156,6 +189,15 @@ class KnowledgeBase:
         docs = self.db.similarity_search(query, k=k)
         return [doc.page_content for doc in docs]
 
+    def save_rag_context(self, query, k=5, out_path="rag_context.txt"):
+        """Save the top-k retrieved context for a query to a text file."""
+        docs = self.db.similarity_search(query, k=k) if self.db else []
+        with open(out_path, "w", encoding="utf-8") as f:
+            for i, doc in enumerate(docs, 1):
+                src = doc.metadata.get("source", "unknown")
+                f.write(f"[{i}] Source: {src}\n{doc.page_content}\n\n")
+        print(f"Saved RAG context for query '{query}' to {out_path}")
+
 
 class CustomerSupportChatbot:
     def __init__(self, model_path='c:/Users/chaid/Jin/trained-customer-support-bot', knowledge_base_path="./knowledge_base"):
@@ -189,20 +231,27 @@ class CustomerSupportChatbot:
         
         # Get relevant context from knowledge base
         context_docs = self.knowledge_base.search_documents(customer_message, k=3)
-        context_section = ""
+        context_section = "No relevant context found."
         if context_docs:
             # Frame the context clearly for the model
-            context_section = "---CONTEXT---\n" + "\n---\n".join(context_docs) + "\n---END CONTEXT---"
+            context_section = "\n\n---\n\n".join(context_docs)
         
         # Create a more explicit and structured input prompt
         instruction = (
             "You are a helpful Amazon customer support assistant. "
-            "Use the provided context to answer the customer's question directly. "
-            "If the context does not contain the answer, state that you don't have that information. "
-            "Do not ask the user to contact support through another channel or to send a DM."
+            "Answer the customer's question based *only* on the context provided below. "
+            "If the context does not contain the answer, state that you don't have the information. "
+            "Do not ask to send a DM or contact support elsewhere. Be concise."
         )
         
-        input_text = f"{instruction}\n\n{context_section}\n\n---CONVERSATION HISTORY---\n{history_prompt}\nSupport:"
+        input_text = (
+            f"{instruction}\n\n"
+            f"---CONTEXT---\n{context_section}\n---END CONTEXT---\n\n"
+            f"---CONVERSATION HISTORY---\n{history_prompt}\n---END CONVERSATION HISTORY---\n\n"
+            f"Based on the context, answer the following question:\n"
+            f"Question: {customer_message}\n"
+            f"Answer:"
+        )
         
         response = "" # Initialize response to handle cases where all retries fail
         for attempt in range(max_retries + 1):
@@ -231,8 +280,14 @@ class CustomerSupportChatbot:
             generated_text = self.tokenizer.decode(output[0], skip_special_tokens=True)
             
             # Isolate the newly generated text more reliably
-            response_start = generated_text.find(history_prompt) + len(history_prompt)
-            response = generated_text[response_start:].replace("Support:", "").strip()
+            response_start_tag = "Answer:"
+            response_start_index = generated_text.rfind(response_start_tag)
+            if response_start_index != -1:
+                response = generated_text[response_start_index + len(response_start_tag):].strip()
+            else:
+                # Fallback if the 'Answer:' tag is not in the output
+                response_start = generated_text.find(history_prompt) + len(history_prompt)
+                response = generated_text[response_start:].replace("Support:", "").strip()
 
             # If the response does not contain a DM request, clean and return it
             if not self.dm_pattern.search(response):
@@ -313,16 +368,26 @@ class CustomerSupportChatbot:
 
 def setup_knowledge_base():
     """Set up the knowledge base with Amazon help pages"""
-    amazon_urls = [
-        "https://www.amazon.ca/gp/help/customer/display.html?nodeId=GGE5X8EV7VNVTK6R",
-        "https://www.amazon.com/gp/help/customer/display.html?nodeId=GKM69DUUYKQWKWX7",
-        "https://www.amazon.ca/gp/help/customer/display.html?nodeId=GSD587LKW72HKU2V",
-        "https://www.amazon.com/gp/help/customer/display.html",
-        "https://www.amazon.com/gp/help/customer/display.html?nodeId=200127470"
-    ]
+    # amazon_urls = [
+    #     "https://www.amazon.ca/gp/help/customer/display.html?nodeId=GGE5X8EV7VNVTK6R",
+    #     "https://www.amazon.com/gp/help/customer/display.html?nodeId=GKM69DUUYKQWKWX7",
+    #     "https://www.amazon.ca/gp/help/customer/display.html?nodeId=GSD587LKW72HKU2V",
+    #     "https://www.amazon.com/gp/help/customer/display.html",
+    #     "https://www.amazon.com/gp/help/customer/display.html?nodeId=200127470"
+    # ]
     
     kb = KnowledgeBase()
-    kb.build_knowledge_base(amazon_urls)
+    #kb.build_knowledge_base(amazon_urls)
+    kb.build_knowledge_base_from_manual(manual_path="c:/Users/chaid/Jin/CSC525/knowledge_base_manual.txt")
+    # Save all ingested content for quality check
+    if kb.db is not None:
+        kb.save_rag_context(query="", k=10000, out_path="rag_context.txt")  # <-- Add this line
+        with open("all_rag_content.txt", "w", encoding="utf-8") as f:
+            for i, doc in enumerate(kb.db.similarity_search("", k=10000), 1):
+                src = doc.metadata.get("source", "unknown")
+                f.write(f"[{i}] Source: {src}\n{doc.page_content}\n\n")
+        print("Saved all RAG content to all_rag_content.txt")
+    
     return kb
 
 

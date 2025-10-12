@@ -196,7 +196,7 @@ class KnowledgeBase:
         
         docs = self.db.similarity_search(query, k=k)
         if not docs:
-            print(f"No relevant context found for '{query}'. Falling back to top {k} chunks.")
+            # print(f"No relevant context found for '{query}'. Falling back to top {k} chunks.")
             # Fallback: return top k chunks for generic queries
             docs = self.db.similarity_search("", k=k)
         return [doc.page_content for doc in docs]
@@ -283,27 +283,41 @@ class CustomerSupportChatbot:
             )
         
         # Debugging: Print the retrieved context
-        print("Retrieved context for debugging:\n", context_section)
+        # print("Retrieved context for debugging:\n", context_section)
         
         # **IMPROVED: More explicit instruction-following prompt**
-        input_text = (
-            "You are an Amazon customer support agent. Follow these rules strictly:\n"
-            "1. Answer ONLY using information from the Context below\n"
-            "2. Copy relevant phrases directly from the Context\n"
-            "3. After each fact, add [X] where X is the context number\n"
-            "4. If the Context doesn't contain the answer, say: 'I don't have that specific information in our records.'\n"
-            "5. Do NOT use external knowledge or training data\n\n"
-            f"Context:\n{context_section}\n\n"
-            f"Customer: {customer_message}\n"
-            "Support (remember to cite [X] after each fact):"
-        )
+        # Check if we have meaningful context
+        has_meaningful_context = context_docs and any(len(doc.strip()) > 50 for doc in context_docs)
+        
+        if has_meaningful_context:
+            input_text = (
+                "You are an Amazon customer support agent. Follow these rules strictly:\n"
+                "1. Answer ONLY using information from the Context below\n"
+                "2. Copy relevant phrases directly from the Context\n"
+                "3. After each fact, add [X] where X is the context number\n"
+                "4. If the Context doesn't contain the answer, say: 'I don't have that specific information in our records.'\n"
+                "5. Do NOT use external knowledge or training data\n\n"
+                f"Context:\n{context_section}\n\n"
+                f"Customer: {customer_message}\n"
+                "Support (remember to cite [X] after each fact):"
+            )
+        else:
+            # No meaningful context - allow general knowledge
+            input_text = (
+                "You are an Amazon customer support agent. The customer asked a question that is not covered in our knowledge base.\n"
+                "Provide a helpful answer using your general knowledge, but start your response with:\n"
+                "'I don't have specific information about this in our current database, but generally speaking...'\n\n"
+                f"Customer: {customer_message}\n"
+                "Support:"
+            )
         
         # **REMOVED: extractive QA - causes issues with TinyLlama**
         # Try template-based response first for common queries
-        template_response = self.get_template_response(customer_message, context_docs)
-        if template_response:
-            self.history.append(f"Support: {template_response}")
-            return template_response
+        if has_meaningful_context:
+            template_response = self.get_template_response(customer_message, context_docs)
+            if template_response:
+                self.history.append(f"Support: {template_response}")
+                return template_response
         
         response = "" # Initialize response to handle cases where all retries fail
         for attempt in range(max_retries + 1):
@@ -314,7 +328,7 @@ class CustomerSupportChatbot:
             input_ids = encoded_input['input_ids'].to(self.device)
             attention_mask = encoded_input['attention_mask'].to(self.device)
             
-            print(f"Generating response from model (attempt {attempt+1}, temp={current_temp:.2f})...")
+            # print(f"Generating response from model (attempt {attempt+1}, temp={current_temp:.2f})...")
             with torch.no_grad():
                 output = self.model.generate(
                     input_ids,
@@ -343,21 +357,31 @@ class CustomerSupportChatbot:
             # Stop at first newline or when context is repeated
             response = response.split('\n')[0].strip()
             
-            # **RELAXED: Check for ANY citation marker**
-            has_citation = bool(re.search(r'\[\d+\]', response))
-            uses_context_words = self.validate_response_uses_context(response, context_docs)
-            
-            if has_citation or uses_context_words:
-                print(f"✓ Valid response generated (citations={has_citation}, context_match={uses_context_words})")
+            # **RELAXED: Check for ANY citation marker (only if we expected context)**
+            if has_meaningful_context:
+                has_citation = bool(re.search(r'\[\d+\]', response))
+                uses_context_words = self.validate_response_uses_context(response, context_docs)
+                
+                if has_citation or uses_context_words:
+                    # print(f"✓ Valid response generated (citations={has_citation}, context_match={uses_context_words})")
+                    self.history.append(f"Support: {response}")
+                    response = self.clean_response(response)
+                    return response
+                else:
+                    pass
+                    # print(f"✗ Attempt {attempt + 1}: No citations or context match, retrying...")
+            else:
+                # No context expected, just return the response
                 self.history.append(f"Support: {response}")
                 response = self.clean_response(response)
                 return response
-            else:
-                print(f"✗ Attempt {attempt + 1}: No citations or context match, retrying...")
     
         # **FALLBACK: If model fails, construct response manually**
-        print("⚠ Model failed all attempts. Using template fallback.")
-        fallback = self.construct_fallback_response(customer_message, context_docs)
+        # print("⚠ Model failed all attempts. Using template fallback.")
+        if has_meaningful_context:
+            fallback = self.construct_fallback_response(customer_message, context_docs)
+        else:
+            fallback = "I don't have specific information about this in our current database. Could you please provide more details or rephrase your question?"
         self.history.append(f"Support: {fallback}")
         return fallback
 
@@ -384,7 +408,7 @@ class CustomerSupportChatbot:
     def construct_fallback_response(self, question, context_docs):
         """Construct a response by extracting key facts from context"""
         if not context_docs:
-            return "I apologize, but I don't have specific information about that in our current database."
+            return "I don't have specific information about this in our current database. However, I'm here to help - could you please provide more details?"
         
         # Extract first 2 sentences from top context
         top_context = context_docs[0]

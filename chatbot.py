@@ -27,7 +27,10 @@ class KnowledgeBase:
         # Try to load an existing index
         if os.path.exists(os.path.join(index_path, "index.faiss")):
             self.load_knowledge_base()
-        
+        else:
+            print("No existing knowledge base found. Building from manual file...")
+            self.build_knowledge_base_from_manual("c:/Users/chaid/Jin/CSC525/knowledge_base_manual.txt")
+
     # def crawl_website(self, urls, max_depth=1, max_pages=100):
     #     """Crawl websites from the provided URLs"""
     #     urls_to_visit = [(url, 0) for url in urls]  # (url, depth)
@@ -159,7 +162,11 @@ class KnowledgeBase:
     def load_knowledge_base(self):
         """Load the knowledge base from disk"""
         try:
-            self.db = FAISS.load_local(self.index_path, self.embedding_model)
+            self.db = FAISS.load_local(
+                self.index_path, 
+                self.embedding_model,
+                allow_dangerous_deserialization=True  # Add this parameter
+            )
             print(f"Knowledge base loaded from {self.index_path}")
             
             # Load the list of crawled URLs
@@ -184,9 +191,14 @@ class KnowledgeBase:
     def search_documents(self, query, k=3):
         """Search for relevant documents based on a query"""
         if self.db is None:
+            print("Knowledge base is not initialized.")
             return []
         
         docs = self.db.similarity_search(query, k=k)
+        if not docs:
+            print(f"No relevant context found for '{query}'. Falling back to top {k} chunks.")
+            # Fallback: return top k chunks for generic queries
+            docs = self.db.similarity_search("", k=k)
         return [doc.page_content for doc in docs]
 
     def save_rag_context(self, query, k=5, out_path="rag_context.txt"):
@@ -200,7 +212,8 @@ class KnowledgeBase:
 
 
 class CustomerSupportChatbot:
-    def __init__(self, model_path='c:/Users/chaid/Jin/trained-customer-support-bot', knowledge_base_path="./knowledge_base"):
+    def __init__(self, model_path='c:/Users/chaid/Jin/trained-customer-support-bot', # 'TinyLlama/TinyLlama-1.1B-Chat-v1.0',
+                 knowledge_base_path="./knowledge_base"):  
         """Initialize the chatbot with the trained model and tokenizer"""
         print(f"Loading model from {model_path}...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -221,6 +234,20 @@ class CustomerSupportChatbot:
         # Initialize knowledge base
         self.knowledge_base = KnowledgeBase(index_path=knowledge_base_path)
 
+    def extract_answer_from_context(self, question, context_docs):
+        """Extract answer directly from context if model fails"""
+        from transformers import pipeline
+        
+        # Use a dedicated QA model for extraction
+        qa_pipeline = pipeline("question-answering", model="deepset/roberta-base-squad2")
+        
+        combined_context = " ".join(context_docs[:3])  # Use top 3 chunks
+        result = qa_pipeline(question=question, context=combined_context)
+        
+        if result['score'] > 0.3:  # Confidence threshold
+            return f"According to Amazon's policy: {result['answer']}"
+        return None
+
     def generate_response(self, customer_message, max_length=250, temperature=0.8, max_retries=2):
         """Generate a response, with a retry mechanism to avoid canned DM requests."""
         # Append the latest customer message to history
@@ -230,28 +257,40 @@ class CustomerSupportChatbot:
         history_prompt = "\n".join(self.history[-6:])  # 3 customer/support pairs
         
         # Get relevant context from knowledge base
-        context_docs = self.knowledge_base.search_documents(customer_message, k=3)
+        # For policy-related queries, retrieve more context
+        k_context = 5 if "policy" in customer_message.lower() or "return" in customer_message.lower() else 3
+        context_docs = self.knowledge_base.search_documents(customer_message, k=k_context)
         context_section = "No relevant context found."
         if context_docs:
             # Frame the context clearly for the model
             context_section = "\n\n---\n\n".join(context_docs)
         
+        # Debugging: Print the retrieved context
+        print("Retrieved context for debugging:\n", context_section)
+        
         # Create a more explicit and structured input prompt
         instruction = (
             "You are a helpful Amazon customer support assistant. "
-            "Answer the customer's question based *only* on the context provided below. "
-            "If the context does not contain the answer, state that you don't have the information. "
-            "Do not ask to send a DM or contact support elsewhere. Be concise."
+            "You MUST answer using ONLY the policy information provided below. "
+            "Start your answer by referencing the specific policy (e.g., 'According to Amazon's return policy...'). "
+            "If the policy information doesn't contain the answer, say 'I don't have that information in our current policies.' "
+            "Never make up information or suggest contacting support via DM."
         )
         
         input_text = (
             f"{instruction}\n\n"
-            f"---CONTEXT---\n{context_section}\n---END CONTEXT---\n\n"
-            f"---CONVERSATION HISTORY---\n{history_prompt}\n---END CONVERSATION HISTORY---\n\n"
-            f"Based on the context, answer the following question:\n"
-            f"Question: {customer_message}\n"
-            f"Answer:"
+            f"Recent conversation:\n{history_prompt}\n\n"
+            f"Customer question: {customer_message}\n\n"
+            f"Relevant Amazon policy information:\n{context_section}\n\n"
+            f"Based on the policy information above, provide a helpful answer:\n"
+            f"Support:"
         )
+        
+        # Try extractive QA first
+        extracted_answer = self.extract_answer_from_context(customer_message, context_docs)
+        if extracted_answer:
+            self.history.append(f"Support: {extracted_answer}")
+            return extracted_answer
         
         response = "" # Initialize response to handle cases where all retries fail
         for attempt in range(max_retries + 1):
@@ -262,6 +301,7 @@ class CustomerSupportChatbot:
             input_ids = encoded_input['input_ids'].to(self.device)
             attention_mask = encoded_input['attention_mask'].to(self.device)
             
+            print("Generating response from model...") # Added for feedback
             with torch.no_grad():
                 output = self.model.generate(
                     input_ids,
@@ -338,7 +378,9 @@ class CustomerSupportChatbot:
             "language": "en-US"
         }
         try:
-            response = requests.post(url, data=data)
+            # Added a timeout to prevent indefinite hanging
+            response = requests.post(url, data=data, timeout=5)
+            response.raise_for_status() # Raise an exception for bad status codes
             matches = response.json().get("matches", [])
             for match in reversed(matches):  # Reverse to not mess up offsets
                 replacement = match.get("replacements", [])
@@ -346,6 +388,9 @@ class CustomerSupportChatbot:
                     start = match["offset"]
                     end = start + match["length"]
                     text = text[:start] + replacement[0]["value"] + text[end:]
+            return text
+        except requests.exceptions.RequestException as e:
+            print(f"Grammar correction failed due to network error: {e}")
             return text
         except Exception as e:
             print(f"Grammar correction failed: {e}")
@@ -398,8 +443,17 @@ def main():
     if not os.path.exists(os.path.join(kb_path, "index.faiss")):
         print("Building knowledge base from Amazon help pages...")
         setup_knowledge_base()
+    else:
+        print("Knowledge base already exists. Loading...")
     
     chatbot = CustomerSupportChatbot(knowledge_base_path=kb_path)
+    
+    # Verify the knowledge base is loaded
+    if chatbot.knowledge_base.db is None:
+        print("ERROR: Knowledge base failed to load!")
+        return
+    
+    print(f"Knowledge base loaded successfully with {chatbot.knowledge_base.db.index.ntotal} vectors")
     chatbot.chat_session()
 
 

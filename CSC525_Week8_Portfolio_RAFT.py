@@ -1,7 +1,7 @@
 """Amazon Customer Support Model Fine-Tuning with RAFT 
 Part one of the CSC 525 Week 8 Portfolio project.
 steps to run:
-Step1: Install libraries and package
+Step1: Install libraries and packages
 Step2: download training dataset from https://www.kaggle.com/datasets/thoughtvector/customer-support-on-twitter and save twcs.csv in the current directory.
 Step3: Copy policies and guides from amazon help pages. Create knowledge_base_manual.txt file in the current directory.
 step4: Run the fine-tuning program using the amazon dataset and knowledge base. (RAFT: Retrieval Augmented Fine Tuning)
@@ -23,6 +23,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling
 from langdetect import detect, LangDetectException
 import contractions
+from sentence_transformers import SentenceTransformer, util
 
 def expand_contractions(text):
     """Expand common contractions to assist with NLP processing. 
@@ -178,47 +179,62 @@ def strip_user_prefix(text):
 #     formatted_df.to_csv('formatted_training_data.csv', index=False)
 #     return formatted_df
 
-def retrieve_context(question, manual_path, k=1):
-    """Retrieve k most relevant chunks from the manual file for a given question (simple keyword match).
-    Preparared for RAFT implementation."""
-    
-    with open(manual_path, "r", encoding="utf-8") as f:
-        manual = f.read()
-    # Split manual into chunks (paragraphs)
-    chunks = [p.strip() for p in manual.split('\n\n') if len(p.strip()) > 40]
-    # Score by keyword overlap
-    q_words = set(re.findall(r'\b\w+\b', question.lower()))
-    scored = []
-    for chunk in chunks:
-        c_words = set(re.findall(r'\b\w+\b', chunk.lower()))
-        score = len(q_words & c_words)
-        scored.append((score, chunk))
-    # Get top-k
-    top_chunks = [c for s, c in sorted(scored, reverse=True)[:k] if s > 0]
-    return "\n".join(top_chunks) if top_chunks else ""
-
 def format_for_training(conversations_df, tokenizer, use_raft=True, manual_path="c:/Users/chaid/Jin/CSC525/knowledge_base_manual.txt"):
-    """Formats the conversation dataframe for the dataset class, with RAFT context."""
+    """Formats the conversation dataframe for the dataset class, with RAFT context using semantic search."""
     """Adding RAFT functionality to retrieve context from knowledge base manual.
     Zhang, T., et al. (2024). RAFT: Adapting Language Model to Domain Specific RAG. https://arxiv.org/pdf/2403.10131"""
-    print("Formatting data for training...")
+    print("Formatting data for training with semantic retrieval...")
+
+    if use_raft:
+        # 1. Load a pre-trained sentence transformer model
+        print("Loading sentence transformer model for semantic search...")
+        retriever_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+        # 2. Load and chunk the knowledge base
+        with open(manual_path, "r", encoding="utf-8") as f:
+            manual = f.read()
+        chunks = [p.strip() for p in manual.split('\n\n') if len(p.strip()) > 40]
+        print(f"Loaded {len(chunks)} knowledge base chunks.")
+
+        # 3. Encode the knowledge base chunks into embeddings (vectors)
+        print("Encoding knowledge base chunks...")
+        chunk_embeddings = retriever_model.encode(chunks, convert_to_tensor=True, show_progress_bar=True)
+    
     conversations_df['input'] = conversations_df['input'].apply(strip_user_prefix)
     conversations_df['response'] = conversations_df['response'].apply(strip_user_prefix)
+    
     input_texts = []
-    for idx, row in conversations_df.iterrows():
+    # Use tqdm for progress tracking as this can be slow
+    for _, row in tqdm(conversations_df.iterrows(), total=len(conversations_df), desc="Processing conversations"):
         customer_msg = str(row['input'])
+        context = ""
+        
         if use_raft:
-            context = retrieve_context(customer_msg, manual_path, k=1)
-            if context:
-                prompt = f"Context:\n{context}\n\nCustomer: {customer_msg}\nSupport:"
-            else:
-                prompt = f"Customer: {customer_msg}\nSupport:"
+            # 4. Encode the customer message
+            question_embedding = retriever_model.encode(customer_msg, convert_to_tensor=True)
+            
+            # 5. Compute cosine similarity between the question and all chunks
+            cos_scores = util.cos_sim(question_embedding, chunk_embeddings)[0]
+            
+            # 6. Find the best-matching chunk
+            best_chunk_idx = torch.argmax(cos_scores).item()
+            best_score = cos_scores[best_chunk_idx].item()
+            
+            # 7. Retrieve context only if the similarity score is above a threshold
+            if best_score > 0.5: # Threshold can be tuned
+                context = chunks[best_chunk_idx]
+
+        if context:
+            prompt = f"Context:\n{context}\n\nCustomer: {customer_msg}\nSupport:"
         else:
             prompt = f"Customer: {customer_msg}\nSupport:"
+            
         input_texts.append(prompt)
+
     conversations_df['input_text'] = input_texts
     conversations_df['target_text'] = conversations_df['response'].astype(str)
     formatted_df = conversations_df[['input_text', 'target_text', 'company']]
+    
     print(f"Created {len(formatted_df)} formatted training examples (RAFT={use_raft})")
     formatted_df.to_csv('formatted_training_data_RAFT.csv', index=False)
     return formatted_df
@@ -375,8 +391,11 @@ def sample_top_companies(conversation_df, top_companies, total_samples=80000, ra
             print(f"Sampled {n_samples} from {company} (available: {len(company_df)})")
     
     # Combine all samples
+ 
+
+
+
     result_df = pd.concat(sampled_dfs) if sampled_dfs else pd.DataFrame()
-    
     # If we have fewer than total_samples, sample additional records to fill the quota
     if len(result_df) < total_samples:
         additional = filtered_df[~filtered_df.index.isin(result_df.index)]
@@ -384,6 +403,7 @@ def sample_top_companies(conversation_df, top_companies, total_samples=80000, ra
         if len(additional) > 0:
             additional_samples = additional.sample(n=min(n_needed, len(additional)), random_state=random_state)
             result_df = pd.concat([result_df, additional_samples])
+
             print(f"Added {len(additional_samples)} additional samples to reach target")
     
     # Shuffle final result
@@ -482,5 +502,5 @@ if __name__ == "__main__":
     # Set run_training=True to run the training pipeline
     # Set resume_training=True to resume from checkpoint
     # Resume_training=False to start fresh
-    main(run_training=True, sample_size=160000, resume_training=False, conversation_sample_size=160000)
-    
+    main(run_training=True, sample_size=50000, resume_training=False, conversation_sample_size=50000)
+

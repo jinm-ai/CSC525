@@ -29,39 +29,26 @@ def expand_contractions(text):
     """Expand common contractions to assist with NLP processing. 
     Originally I used a manually defined dictonary which took space here. 
     Now using the 'contractions' package for comprehensive coverage."""    
-    # Regular expression to obtain contractions from conversation pairs
-    # contractions_re = re.compile('(%s)' % '|'.join(contractions.keys()))
-    # def replace(match):
-    #     return contractions[match.group(0)]
-    # return contractions_re.sub(replace, text)    
     return contractions.fix(text)
+
 def clean_tweet_text(text):
-    """Clean and preprocess tweet text"""
+    """Clean and preprocess tweet text using lambda pipeline"""
     if pd.isna(text):
         return ""
-    
-    # 1. Decode HTML entities
-    text = html.unescape(text)
-    
-    # 2. Replace emojis with text  
-    text = replace_emojis(text)
-    
-    # 3. Remove URLs
-    text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)
-    
-    # 4. Remove user mentions
-    text = re.sub(r'@\w+', '[USER]', text)
-    
-    # 5. Expand contractions
-    text = expand_contractions(text)
-    
-    # Remove special characters but keep punctuation and apostrophes for contractions
-    text = re.sub(r"[^a-zA-Z0-9\s\.\!\?\,\-\:']", '', text)
-    
-    # Remove extra whitespace
-    text = ' '.join(text.split())
-    
-    return text.strip()
+    steps = [
+        lambda t: html.unescape(t),
+        lambda t: replace_emojis(t),
+        lambda t: re.sub(r'http\S+|www\S+|https\S+', '', t, flags=re.MULTILINE),
+        lambda t: re.sub(r'@\w+', '[USER]', t),
+        lambda t: expand_contractions(t),
+        lambda t: re.sub(r"[^a-zA-Z0-9\s\.\!\?\,\-\:']", '', t),
+        lambda t: ' '.join(t.split()),
+        lambda t: t.strip()
+    ]
+    cleaned = text
+    for step in steps:
+        cleaned = step(cleaned)
+    return cleaned
 
 def replace_emojis(text):
     # Map emojis to text equivalents to make sense to the tokenizer
@@ -69,6 +56,10 @@ def replace_emojis(text):
         "❤️": "[HEART]",
         "🤷": "[SHRUG]",
         "😊": "[SMILE]",
+        "😢": "[CRY]",
+        "👍": "[THUMBS_UP]",
+        "🙏": "[THANKS]",
+        "😡": "[ANGRY]",
     }
     for emoji, replacement in emoji_dict.items():
         text = text.replace(emoji, replacement)
